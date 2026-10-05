@@ -4,11 +4,20 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy.orm import sessionmaker
 from datetime import datetime
-from .database import Base, engine, get_db
+from .database import Base, engine, get_db, SessionLocal
 from . import models
 
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
 Base.metadata.create_all(bind=engine)
+
+from .seed import seed_database
+
+with SessionLocal() as db:
+    if db.query(models.Province).count() == 0:
+        seed_database()
 class GenerationReadingCreate(BaseModel):
     timestamp: datetime
     power_kw: float
