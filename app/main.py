@@ -644,6 +644,104 @@ def get_installation_summary(
         "latest_reading": latest_reading
     }
 
+@app.get("/districts/{district_id}/summary")
+def get_district_summary(
+    district_id: int,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    district = (
+        db.query(models.District)
+        .filter(models.District.id == district_id)
+        .first()
+    )
+
+    if district is None:
+        raise HTTPException(
+            status_code=404,
+            detail="District not found"
+        )
+
+    # Check jurisdiction access
+    if user.role != "admin":
+
+        if user.province_id is not None:
+            if district.province_id != user.province_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="User is not authorized to access this district"
+                )
+
+        if user.district_id is not None:
+            if district.id != user.district_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="User is not authorized to access this district"
+                )
+
+        # A substation user cannot access the whole district
+        if user.substation_id is not None:
+            raise HTTPException(
+                status_code=403,
+                detail="Substation users cannot access district-wide summaries"
+            )
+
+    installations = (
+        db.query(models.SolarInstallation)
+        .join(
+            models.GridSubstation,
+            models.SolarInstallation.substation_id
+            == models.GridSubstation.id
+        )
+        .filter(
+            models.GridSubstation.district_id == district_id
+        )
+        .all()
+    )
+
+    total_capacity_kw = sum(
+        installation.capacity_kw
+        for installation in installations
+    )
+
+    total_current_power_kw = 0
+    total_cumulative_energy_kwh = 0
+
+    for installation in installations:
+
+        latest_reading = (
+            db.query(models.GenerationReading)
+            .filter(
+                models.GenerationReading.installation_id
+                == installation.id
+            )
+            .order_by(
+                models.GenerationReading.timestamp.desc()
+            )
+            .first()
+        )
+
+        if latest_reading:
+            total_current_power_kw += latest_reading.power_kw
+            total_cumulative_energy_kwh += (
+                latest_reading.cumulative_energy_kwh
+            )
+
+    return {
+        "district": {
+            "id": district.id,
+            "name": district.name
+        },
+        "summary": {
+            "total_installations": len(installations),
+            "total_capacity_kw": round(total_capacity_kw, 3),
+            "current_power_kw": round(total_current_power_kw, 3),
+            "cumulative_energy_kwh": round(
+                total_cumulative_energy_kwh, 3
+            )
+        }
+    }
+
 
     query = (
         db.query(models.GenerationReading)
