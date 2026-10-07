@@ -164,9 +164,10 @@ def seed_database():
             substation = substations[i % len(substations)]
 
             installation = SolarInstallation(
-                meter_id=f"SLSEA-METER-{i + 1:04d}",
+                meter_id=f"SLSEA-METER-{i+1:04d}",
                 capacity_kw=random.choice(capacities),
-                substation_id=substation.id
+                substation_id=substation.id,
+                device_api_key=f"device-key-{i+1:04d}"
             )
 
             db.add(installation)
@@ -201,6 +202,9 @@ def seed_database():
 
         for installation in installations:
 
+            installation_id = installation.id
+            installation_capacity = installation.capacity_kw
+
             cumulative_energy = 0.0
 
             for interval in range(number_of_days * readings_per_day):
@@ -226,10 +230,10 @@ def seed_database():
                     )
 
                     power = (
-                        installation.capacity_kw
-                        * solar_factor
-                        * random.uniform(0.75, 1.0)
-                    )
+                        installation_capacity
+                         * solar_factor
+                         * random.uniform(0.75, 1.0)
+                )
 
                 else:
                     power = 0.0
@@ -242,7 +246,7 @@ def seed_database():
                 voltage = random.uniform(220, 240)
 
                 reading = GenerationReading(
-                    installation_id=installation.id,
+                    installation_id=installation_id,
                     timestamp=timestamp,
                     power_kw=round(power, 3),
                     cumulative_energy_kwh=round(

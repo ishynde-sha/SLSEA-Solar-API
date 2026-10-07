@@ -1,4 +1,5 @@
 from urllib import response
+from urllib.parse import urlencode
 from fastapi import FastAPI, Depends, HTTPException, Query, Response, Header, Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -25,15 +26,35 @@ class GenerationReadingCreate(BaseModel):
     voltage: float
 
 def verify_device_api_key(
-    x_api_key: str | None = Header(default=None)
+    installation_id: int,
+    x_api_key: str | None = Header(default=None),
+    db: Session = Depends(get_db)
 ):
-    if x_api_key != "solar-device-key-123":
+    if not x_api_key:
         raise HTTPException(
             status_code=401,
-            detail="Invalid or missing device API key"
+            detail="Missing device API key"
         )
 
-    return x_api_key
+    installation = (
+        db.query(models.SolarInstallation)
+        .filter(models.SolarInstallation.id == installation_id)
+        .first()
+    )
+
+    if installation is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Solar installation not found"
+        )
+
+    if x_api_key != installation.device_api_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid device API key for this installation"
+        )
+
+    return installation
 def get_current_user(
     x_user: str | None = Header(default=None),
     db: Session = Depends(get_db)
@@ -95,10 +116,51 @@ def check_user_scope(user, installation):
         and user.district_id is None
         and user.substation_id is None
     ):
-        raise HTTPException(
+                raise HTTPException(
             status_code=403,
             detail="User has no assigned jurisdiction"
         )
+
+
+def get_user_scope_ids(user):
+    """
+    Returns the jurisdiction IDs available to the current user.
+    Admin users have unrestricted access.
+    """
+
+    if user.role == "admin":
+        return {
+            "province_id": None,
+            "district_id": None,
+            "substation_id": None
+        }
+
+    if user.substation_id is not None:
+        return {
+            "province_id": None,
+            "district_id": None,
+            "substation_id": user.substation_id
+        }
+
+    if user.district_id is not None:
+        return {
+            "province_id": None,
+            "district_id": user.district_id,
+            "substation_id": None
+        }
+
+    if user.province_id is not None:
+        return {
+            "province_id": user.province_id,
+            "district_id": None,
+            "substation_id": None
+        }
+
+    raise HTTPException(
+        status_code=403,
+        detail="User has no assigned jurisdiction"
+    )
+
 
 app = FastAPI(title="SLSEA Solar API")
 
@@ -138,7 +200,7 @@ async def validation_exception_handler(
     exc: RequestValidationError
 ):
     return JSONResponse(
-        status_code=422,
+        status_code=400,
         content={
             "code": "VALIDATION_ERROR",
             "message": "Request validation failed.",
@@ -155,13 +217,14 @@ def home():
 @app.post(
     "/installations/{installation_id}/readings",
     status_code=201,
-    dependencies=[Depends(verify_device_api_key)]
+    # dependencies=[Depends(verify_device_api_key)]
 )
 def create_generation_reading(
     installation_id: int,
     reading: GenerationReadingCreate,
     response: Response,
     idempotency_key: str | None = Header(default=None),
+    installation = Depends(verify_device_api_key),
     db: Session = Depends(get_db)
 ):
     installation = (
@@ -231,21 +294,77 @@ def create_generation_reading(
     return new_reading      
 
 @app.get("/provinces")
-def get_provinces(db: Session = Depends(get_db)):
-    provinces = db.query(models.Province).all()
+def get_provinces(
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    scope = get_user_scope_ids(user)
 
-    return provinces
+    query = db.query(models.Province)
+
+    if scope["province_id"] is not None:
+        query = query.filter(
+            models.Province.id == scope["province_id"]
+        )
+
+    elif scope["district_id"] is not None:
+        query = (
+            query
+            .join(models.District)
+            .filter(
+                models.District.id == scope["district_id"]
+            )
+        )
+
+    elif scope["substation_id"] is not None:
+        query = (
+            query
+            .join(models.District)
+            .join(models.GridSubstation)
+            .filter(
+                models.GridSubstation.id == scope["substation_id"]
+            )
+        )
+
+    return query.all()
 
 @app.get("/districts")
-def get_districts(db: Session = Depends(get_db)):
-    districts = db.query(models.District).all()
+def get_districts(
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    scope = get_user_scope_ids(user)
 
-    return districts
+    query = db.query(models.District)
 
+    if scope["substation_id"] is not None:
+        query = (
+            query
+            .join(models.GridSubstation)
+            .filter(
+                models.GridSubstation.id
+                == scope["substation_id"]
+            )
+        )
+
+    elif scope["district_id"] is not None:
+        query = query.filter(
+            models.District.id
+            == scope["district_id"]
+        )
+
+    elif scope["province_id"] is not None:
+        query = query.filter(
+            models.District.province_id
+            == scope["province_id"]
+        )
+
+    return query.all()
 @app.get("/districts/{district_id}")
 def get_district(
     district_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
 ):
     district = (
         db.query(models.District)
@@ -259,12 +378,49 @@ def get_district(
             detail="District not found"
         )
 
+    # Admin can access any district
+    if user.role != "admin":
+
+        # Province-scoped user
+        if user.province_id is not None:
+            if district.province_id != user.province_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied for this district"
+                )
+
+        # District-scoped user
+        elif user.district_id is not None:
+            if district.id != user.district_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied for this district"
+                )
+
+        # Substation-scoped user
+        elif user.substation_id is not None:
+            substation = (
+                db.query(models.GridSubstation)
+                .filter(
+                    models.GridSubstation.id
+                    == user.substation_id
+                )
+                .first()
+            )
+
+            if substation is None or substation.district_id != district.id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied for this district"
+                )
+
     return district
 
 @app.get("/provinces/{province_id}/districts")
 def get_province_districts(
     province_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
 ):
     province = (
         db.query(models.Province)
@@ -278,19 +434,102 @@ def get_province_districts(
             detail="Province not found"
         )
 
+    # Check whether the user is allowed to access this province
+    if user.role != "admin":
+
+        if user.province_id is not None:
+            if user.province_id != province_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied for this province"
+                )
+
+        elif user.district_id is not None:
+            district = (
+                db.query(models.District)
+                .filter(
+                    models.District.id == user.district_id
+                )
+                .first()
+            )
+
+            if district is None or district.province_id != province_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied for this province"
+                )
+
+        elif user.substation_id is not None:
+            substation = (
+                db.query(models.GridSubstation)
+                .filter(
+                    models.GridSubstation.id == user.substation_id
+                )
+                .first()
+            )
+
+            if substation is None:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied for this province"
+                )
+
+            district = (
+                db.query(models.District)
+                .filter(
+                    models.District.id == substation.district_id
+                )
+                .first()
+            )
+
+            if district is None or district.province_id != province_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied for this province"
+                )
+
     districts = (
         db.query(models.District)
-        .filter(models.District.province_id == province_id)
+        .filter(
+            models.District.province_id == province_id
+        )
         .all()
     )
 
     return districts
 
 @app.get("/substations")
-def get_substations(db: Session = Depends(get_db)):
-    substations = db.query(models.GridSubstation).all()
+def get_substations(
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    scope = get_user_scope_ids(user)
 
-    return substations
+    query = db.query(models.GridSubstation)
+
+    if scope["substation_id"] is not None:
+        query = query.filter(
+            models.GridSubstation.id
+            == scope["substation_id"]
+        )
+
+    elif scope["district_id"] is not None:
+        query = query.filter(
+            models.GridSubstation.district_id
+            == scope["district_id"]
+        )
+
+    elif scope["province_id"] is not None:
+        query = (
+            query
+            .join(models.District)
+            .filter(
+                models.District.province_id
+                == scope["province_id"]
+            )
+        )
+
+    return query.all()
 
 @app.get("/substations/{substation_id}")
 def get_substation(
@@ -314,7 +553,8 @@ def get_substation(
 @app.get("/districts/{district_id}/substations")
 def get_district_substations(
     district_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
 ):
     district = (
         db.query(models.District)
@@ -328,6 +568,48 @@ def get_district_substations(
             detail="District not found"
         )
 
+    # Check jurisdiction
+    if user.role != "admin":
+
+        # Province-scoped user
+        if user.province_id is not None:
+            if district.province_id != user.province_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied for this district"
+                )
+
+        # District-scoped user
+        elif user.district_id is not None:
+            if district.id != user.district_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied for this district"
+                )
+
+        # Substation-scoped user
+        elif user.substation_id is not None:
+            substation = (
+                db.query(models.GridSubstation)
+                .filter(
+                    models.GridSubstation.id
+                    == user.substation_id
+                )
+                .first()
+            )
+
+            if substation is None:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied for this district"
+                )
+
+            if substation.district_id != district.id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied for this district"
+                )
+
     substations = (
         db.query(models.GridSubstation)
         .filter(
@@ -339,19 +621,49 @@ def get_district_substations(
     return substations
 
 @app.get("/installations")
-def get_installations(db: Session = Depends(get_db)):
-    installations = (
-        db.query(models.SolarInstallation)
-        .all()
-    )
+def get_installations(
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    scope = get_user_scope_ids(user)
 
-    return installations
+    query = db.query(models.SolarInstallation)
+
+    if scope["substation_id"] is not None:
+        query = query.filter(
+            models.SolarInstallation.substation_id
+            == scope["substation_id"]
+        )
+
+    elif scope["district_id"] is not None:
+        query = (
+            query
+            .join(models.GridSubstation)
+            .filter(
+                models.GridSubstation.district_id
+                == scope["district_id"]
+            )
+        )
+
+    elif scope["province_id"] is not None:
+        query = (
+            query
+            .join(models.GridSubstation)
+            .join(models.District)
+            .filter(
+                models.District.province_id
+                == scope["province_id"]
+            )
+        )
+
+    return query.all()
 
 @app.get("/installations/{installation_id}")
 def get_installation(
     installation_id: int,
     response: Response,
     if_none_match: str | None = Header(default=None),
+    if_match: str | None = Header(default=None),
     db: Session = Depends(get_db),
     user = Depends(get_current_user)
 ):
@@ -368,13 +680,52 @@ def get_installation(
             status_code=404,
             detail="Solar installation not found"
         )
-        check_user_scope(user, installation)
+
+    check_user_scope(user, installation)
 
     etag = f'"installation-{installation.id}-{installation.meter_id}"'
 
+    if if_match is not None and if_match != etag:
+        raise HTTPException(
+            status_code=412,
+            detail="If-Match value does not match the current resource"
+        )
+
     if if_none_match == etag:
-        response.status_code = 304
-    return Response(status_code=304)
+        return Response(
+            status_code=304,
+            headers={"ETag": etag}
+        )
+
+    response.headers["ETag"] = etag
+
+    return installation
+    installation = (
+        db.query(models.SolarInstallation)
+        .filter(
+            models.SolarInstallation.id == installation_id
+        )
+        .first()
+    )
+
+    if installation is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Solar installation not found"
+        )
+
+    # Check whether the user is allowed to access this installation
+    check_user_scope(user, installation)
+
+    # Create an ETag for this installation
+    etag = f'"installation-{installation.id}-{installation.meter_id}"'
+
+    # Conditional GET
+    if if_none_match == etag:
+        return Response(
+            status_code=304,
+            headers={"ETag": etag}
+        )
 
     response.headers["ETag"] = etag
 
@@ -383,7 +734,8 @@ def get_installation(
 @app.get("/substations/{substation_id}/installations")
 def get_substation_installations(
     substation_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
 ):
     substation = (
         db.query(models.GridSubstation)
@@ -399,6 +751,42 @@ def get_substation_installations(
             detail="Grid substation not found"
         )
 
+    # Check jurisdiction
+    if user.role != "admin":
+
+        # Substation-scoped user
+        if user.substation_id is not None:
+            if substation.id != user.substation_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied for this substation"
+                )
+
+        # District-scoped user
+        elif user.district_id is not None:
+            if substation.district_id != user.district_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied for this substation"
+                )
+
+        # Province-scoped user
+        elif user.province_id is not None:
+            district = (
+                db.query(models.District)
+                .filter(
+                    models.District.id
+                    == substation.district_id
+                )
+                .first()
+            )
+
+            if district is None or district.province_id != user.province_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied for this substation"
+                )
+
     installations = (
         db.query(models.SolarInstallation)
         .filter(
@@ -409,6 +797,46 @@ def get_substation_installations(
     )
 
     return installations
+
+@app.get("/installations/{installation_id}/readings/{reading_id}")
+def get_reading(
+    installation_id: int,
+    reading_id: int,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    installation = (
+        db.query(models.SolarInstallation)
+        .filter(
+            models.SolarInstallation.id == installation_id
+        )
+        .first()
+    )
+
+    if installation is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Solar installation not found"
+        )
+
+    check_user_scope(user, installation)
+
+    reading = (
+        db.query(models.GenerationReading)
+        .filter(
+            models.GenerationReading.id == reading_id,
+            models.GenerationReading.installation_id == installation_id
+        )
+        .first()
+    )
+
+    if reading is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Generation reading not found"
+        )
+
+    return reading
 
 @app.get("/installations/{installation_id}/readings")
 def get_installation_readings(
@@ -459,43 +887,43 @@ def get_installation_readings(
             models.GenerationReading.timestamp <= end_time
         )
 
+    # Join related tables only once when jurisdiction filters are used
+    if substation_id or district_id or province_id:
+        query = query.join(
+            models.SolarInstallation,
+            models.GenerationReading.installation_id
+            == models.SolarInstallation.id
+        )
+
+        if district_id or province_id:
+            query = query.join(
+                models.GridSubstation,
+                models.SolarInstallation.substation_id
+                == models.GridSubstation.id
+            )
+
+        if province_id:
+            query = query.join(
+                models.District,
+                models.GridSubstation.district_id
+                == models.District.id
+            )
+
     # Substation filtering
     if substation_id:
-        query = query.join(
-            models.SolarInstallation
-        ).filter(
+        query = query.filter(
             models.SolarInstallation.substation_id == substation_id
         )
 
     # District filtering
     if district_id:
-        query = query.join(
-            models.SolarInstallation,
-            models.GenerationReading.installation_id
-            == models.SolarInstallation.id
-        ).join(
-            models.GridSubstation,
-            models.SolarInstallation.substation_id
-            == models.GridSubstation.id
-        ).filter(
+        query = query.filter(
             models.GridSubstation.district_id == district_id
         )
 
     # Province filtering
     if province_id:
-        query = query.join(
-            models.SolarInstallation,
-            models.GenerationReading.installation_id
-            == models.SolarInstallation.id
-        ).join(
-            models.GridSubstation,
-            models.SolarInstallation.substation_id
-            == models.GridSubstation.id
-        ).join(
-            models.District,
-            models.GridSubstation.district_id
-            == models.District.id
-        ).filter(
+        query = query.filter(
             models.District.province_id == province_id
         )
 
@@ -523,30 +951,48 @@ def get_installation_readings(
     )
 
     # Pagination links
+    base_path = f"/installations/{installation_id}/readings"
+
+    query_params = {
+        "page_size": page_size,
+        "sort": sort
+    }
+
+    if start_time:
+        query_params["start_time"] = start_time.isoformat()
+
+    if end_time:
+        query_params["end_time"] = end_time.isoformat()
+
+    if substation_id is not None:
+        query_params["substation_id"] = substation_id
+
+    if district_id is not None:
+        query_params["district_id"] = district_id
+
+    if province_id is not None:
+        query_params["province_id"] = province_id
+
     next_page = None
     previous_page = None
 
     if offset + page_size < total:
-        next_page = (
-            f"/installations/{installation_id}/readings"
-            f"?page={page + 1}&page_size={page_size}"
-        )
+        next_params = query_params.copy()
+        next_params["page"] = page + 1
+        next_page = f"{base_path}?{urlencode(next_params)}"
 
     if page > 1:
-        previous_page = (
-            f"/installations/{installation_id}/readings"
-            f"?page={page - 1}&page_size={page_size}"
-        )
+        previous_params = query_params.copy()
+        previous_params["page"] = page - 1
+        previous_page = f"{base_path}?{urlencode(previous_params)}"
 
     return {
-        "data": readings,
-        "pagination": {
-            "page": page,
-            "page_size": page_size,
-            "total": total,
-            "next": next_page,
-            "previous": previous_page
-        }
+        "readings": readings,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "next_page": next_page,
+        "previous_page": previous_page,
     }
 
 @app.get("/installations/{installation_id}/readings/latest")
@@ -739,102 +1185,5 @@ def get_district_summary(
             "cumulative_energy_kwh": round(
                 total_cumulative_energy_kwh, 3
             )
-        }
-    }
-
-
-    query = (
-        db.query(models.GenerationReading)
-        .filter(
-            models.GenerationReading.installation_id == installation_id
-        )
-    )
-
-    if start_time:
-        query = query.filter(
-            models.GenerationReading.timestamp >= start_time
-        )
-
-    if end_time:
-        query = query.filter(
-            models.GenerationReading.timestamp <= end_time
-        )
-    if substation_id:
-        query = query.join(
-            models.SolarInstallation
-        ).filter(
-            models.SolarInstallation.substation_id == substation_id
-        )
-        if district_id:
-            query = query.join(
-                models.SolarInstallation,
-                models.GenerationReading.installation_id ==
-                models.SolarInstallation.id
-            ).join(
-                models.GridSubstation,
-                models.SolarInstallation.substation_id ==
-                models.GridSubstation.id
-            ).filter(
-                models.GridSubstation.district_id == district_id
-            )
-            if province_id:
-                query = query.join(
-                    models.SolarInstallation,
-                    models.GenerationReading.installation_id ==
-                    models.SolarInstallation.id
-                ).join(
-                    models.GridSubstation,
-                    models.SolarInstallation.substation_id ==
-                    models.GridSubstation.id
-                ).join(
-                    models.District,
-                    models.GridSubstation.district_id ==
-                    models.District.id
-                ).filter(
-                    models.District.province_id == province_id
-                )
-
-    if sort == "desc":
-        query = query.order_by(
-            models.GenerationReading.timestamp.desc()
-        )
-    else:
-        query = query.order_by(
-            models.GenerationReading.timestamp.asc()
-        )
-    total = query.count()
-
-    offset = (page - 1) * page_size
-
-    readings = (
-        query
-        .offset(offset)
-        .limit(page_size)
-        .all()
-    )
-
-    next_page = None
-    previous_page = None
-
-    if offset + page_size < total:
-        next_page = (
-            f"/installations/{installation_id}/readings"
-            f"?page={page + 1}&page_size={page_size}"
-        )
-
-    if page > 1:
-        previous_page = (
-            f"/installations/{installation_id}/readings"
-            f"?page={page - 1}&page_size={page_size}"
-        )
-
-    return {
-        "data": readings,
-        "pagination": {
-            "page": page,
-            "page_size": page_size,
-            "total": total,
-            "next": next_page,
-            "previous": previous_page
         }
     }

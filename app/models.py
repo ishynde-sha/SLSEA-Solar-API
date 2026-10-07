@@ -63,6 +63,11 @@ class SolarInstallation(Base):
     __tablename__ = "solar_installations"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    device_api_key: Mapped[str] = mapped_column(
+        String(255),
+        unique=True,
+        nullable=False
+    )
 
     meter_id: Mapped[str] = mapped_column(
         String(100),
