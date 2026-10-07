@@ -686,7 +686,7 @@ def get_installation(
     etag = f'W/"installation-{installation.id}-{installation.meter_id}"'
 
     if if_match is not None and if_match != etag:
-    raise HTTPException(
+     raise HTTPException(
         status_code=412,
         detail="If-Match value does not match the current resource"
     )
