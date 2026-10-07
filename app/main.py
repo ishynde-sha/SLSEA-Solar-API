@@ -121,6 +121,43 @@ def check_user_scope(user, installation):
             detail="User has no assigned jurisdiction"
         )
 
+def check_substation_scope(user, substation):
+    if user.role == "admin":
+        return
+
+    district = substation.district
+    province = district.province
+
+    if user.province_id is not None:
+        if province.id != user.province_id:
+            raise HTTPException(
+                status_code=403,
+                detail="User is not authorized to access this province"
+            )
+
+    if user.district_id is not None:
+        if district.id != user.district_id:
+            raise HTTPException(
+                status_code=403,
+                detail="User is not authorized to access this district"
+            )
+
+    if user.substation_id is not None:
+        if substation.id != user.substation_id:
+            raise HTTPException(
+                status_code=403,
+                detail="User is not authorized to access this substation"
+            )
+
+    if (
+        user.province_id is None
+        and user.district_id is None
+        and user.substation_id is None
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="User has no assigned jurisdiction"
+        )
 
 def get_user_scope_ids(user):
     """
@@ -175,6 +212,7 @@ async def http_exception_handler(
         403: "FORBIDDEN",
         404: "NOT_FOUND",
         405: "METHOD_NOT_ALLOWED",
+        406: "NOT_ACCEPTABLE",
         409: "CONFLICT",
         422: "UNPROCESSABLE_ENTITY",
         500: "INTERNAL_SERVER_ERROR"
@@ -207,6 +245,24 @@ async def validation_exception_handler(
             "detail": exc.errors()
         }
     )
+
+
+@app.middleware("http")
+async def content_negotiation_middleware(request: Request, call_next):
+    accept = request.headers.get("accept", "*/*")
+
+    if "application/xml" in accept and "application/json" not in accept and "*/*" not in accept:
+        return JSONResponse(
+            status_code=406,
+            content={
+                "code": "NOT_ACCEPTABLE",
+                "message": "Only application/json responses are supported.",
+                "detail": "The requested response format is not supported."
+            }
+        )
+
+    return await call_next(request)
+
 
 @app.get("/")
 def home():
@@ -534,7 +590,8 @@ def get_substations(
 @app.get("/substations/{substation_id}")
 def get_substation(
     substation_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
 ):
     substation = (
         db.query(models.GridSubstation)
@@ -547,6 +604,7 @@ def get_substation(
             status_code=404,
             detail="Grid substation not found"
         )
+    check_substation_scope(user, substation)
 
     return substation
 
@@ -685,6 +743,8 @@ def get_installation(
 
     etag = f'W/"installation-{installation.id}-{installation.meter_id}"'
 
+    last_modified = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
+
     if if_match is not None and if_match != etag:
      raise HTTPException(
         status_code=412,
@@ -692,9 +752,23 @@ def get_installation(
     )
 
     if if_none_match == etag:
-        return Response(status_code=304, headers={"ETag": etag})        
+        return Response(
+        status_code=304,
+        headers={
+            "ETag": etag,
+            "Last-Modified": last_modified
+        }
+    )     
 
     response.headers["ETag"] = etag
+    response.headers["Last-Modified"] = last_modified
+
+    return {
+    "id": installation.id,
+    "meter_id": installation.meter_id,
+    "capacity_kw": installation.capacity_kw,
+    "substation_id": installation.substation_id
+}
 
     return installation
     
