@@ -683,19 +683,16 @@ def get_installation(
 
     check_user_scope(user, installation)
 
-    etag = f'"installation-{installation.id}-{installation.meter_id}"'
+    etag = f'W/"installation-{installation.id}-{installation.meter_id}"'
 
     if if_match is not None and if_match != etag:
-        raise HTTPException(
-            status_code=412,
-            detail="If-Match value does not match the current resource"
-        )
+    raise HTTPException(
+        status_code=412,
+        detail="If-Match value does not match the current resource"
+    )
 
     if if_none_match == etag:
-        return Response(
-            status_code=304,
-            headers={"ETag": etag}
-        )
+        return Response(status_code=304, headers={"ETag": etag})        
 
     response.headers["ETag"] = etag
 
