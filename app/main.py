@@ -700,36 +700,7 @@ def get_installation(
     response.headers["ETag"] = etag
 
     return installation
-    installation = (
-        db.query(models.SolarInstallation)
-        .filter(
-            models.SolarInstallation.id == installation_id
-        )
-        .first()
-    )
-
-    if installation is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Solar installation not found"
-        )
-
-    # Check whether the user is allowed to access this installation
-    check_user_scope(user, installation)
-
-    # Create an ETag for this installation
-    etag = f'"installation-{installation.id}-{installation.meter_id}"'
-
-    # Conditional GET
-    if if_none_match == etag:
-        return Response(
-            status_code=304,
-            headers={"ETag": etag}
-        )
-
-    response.headers["ETag"] = etag
-
-    return installation
+    
 
 @app.get("/substations/{substation_id}/installations")
 def get_substation_installations(
@@ -797,46 +768,6 @@ def get_substation_installations(
     )
 
     return installations
-
-@app.get("/installations/{installation_id}/readings/{reading_id}")
-def get_reading(
-    installation_id: int,
-    reading_id: int,
-    db: Session = Depends(get_db),
-    user = Depends(get_current_user)
-):
-    installation = (
-        db.query(models.SolarInstallation)
-        .filter(
-            models.SolarInstallation.id == installation_id
-        )
-        .first()
-    )
-
-    if installation is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Solar installation not found"
-        )
-
-    check_user_scope(user, installation)
-
-    reading = (
-        db.query(models.GenerationReading)
-        .filter(
-            models.GenerationReading.id == reading_id,
-            models.GenerationReading.installation_id == installation_id
-        )
-        .first()
-    )
-
-    if reading is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Generation reading not found"
-        )
-
-    return reading
 
 @app.get("/installations/{installation_id}/readings")
 def get_installation_readings(
@@ -1033,6 +964,46 @@ def get_latest_reading(
         )
 
     return latest_reading
+
+@app.get("/installations/{installation_id}/readings/{reading_id}")
+def get_reading(
+    installation_id: int,
+    reading_id: int,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    installation = (
+        db.query(models.SolarInstallation)
+        .filter(
+            models.SolarInstallation.id == installation_id
+        )
+        .first()
+    )
+
+    if installation is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Solar installation not found"
+        )
+
+    check_user_scope(user, installation)
+
+    reading = (
+        db.query(models.GenerationReading)
+        .filter(
+            models.GenerationReading.id == reading_id,
+            models.GenerationReading.installation_id == installation_id
+        )
+        .first()
+    )
+
+    if reading is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Generation reading not found"
+        )
+
+    return reading
 
 @app.get("/installations/{installation_id}/summary")
 def get_installation_summary(
